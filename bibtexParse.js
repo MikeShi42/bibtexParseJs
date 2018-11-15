@@ -26,13 +26,19 @@
 //value_braces -> '{' .*? '"'; // not quite
 (function(exports) {
 
-    function BibtexParser() {
+    function BibtexParser(options) {
 
         this.months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-        this.notKey = [',','{','}',' ','='];
+        this.notKey = [',','{','}',' ','=', '\n'];
         this.pos = 0;
         this.input = "";
         this.entries = new Array();
+        this.options = options || {};
+        // If the user only wants to match certain types, create a regex
+        if (this.options.matchTypes) {
+            var types = this.options.matchTypes;
+            this.matchRegex = new RegExp('^(' + types.join('|') + ')', 'i');
+        }
 
         this.currentEntry = "";
 
@@ -55,7 +61,7 @@
             if (this.input.substring(this.pos, this.pos + s.length) == s) {
                 this.pos += s.length;
             } else {
-                throw TypeError("Token mismatch: match", "expected " + s + ", found "
+                throw TypeError("Token mismatch: match\n" + "expected " + s + ", found "
                         + this.input.substring(this.pos));
             };
             this.skipWhitespace(canCommentOut);
@@ -80,15 +86,21 @@
             };
 
             if (this.input[this.pos] == '@') {
+                // If user defined a pattern we should be looking for
+                if (this.matchRegex) {
+                    return this.input.slice(this.pos+1).match(this.matchRegex);
+                }
                 return true;
             };
             return false;
         };
 
+        var whitespaceRegex = /^\s+/;
         this.skipWhitespace = function(canCommentOut) {
-            while (this.isWhitespace(this.input[this.pos])) {
-                this.pos++;
-            };
+            var whitespaceMatches = this.input.slice(this.pos).match(whitespaceRegex);
+            if (whitespaceMatches && whitespaceMatches.length > 0) {
+                this.pos += whitespaceMatches[0].length;
+            }
             if (this.input[this.pos] == "%" && canCommentOut == true) {
                 while (this.input[this.pos] != "\n") {
                     this.pos++;
@@ -103,6 +115,7 @@
             var start = this.pos;
             var escaped = false;
             while (true) {
+                // console.log('valuee', this.input[this.pos], escaped, bracecount);
                 if (!escaped) {
                     if (this.input[this.pos] == '}') {
                         if (bracecount > 0) {
@@ -112,6 +125,28 @@
                             this.match("}", false);
                             return this.input.substring(start, end);
                         };
+                    } else if (this.input[this.pos] == ',' && bracecount == 0) {
+                        // If there's a comma followed by a new line without
+                        // a closing brace. We check if there might be a key (= sign)
+                        // in the next line. If there is, this is probably just
+                        // a missing }. Else, this is a multi-line value
+                        var nextPos = this.pos + 1;
+                        if (nextPos < this.input.length) {
+                            if (this.input[nextPos] == '\n') {
+                                var tempPos = nextPos + 1;
+                                // Look ahead to the next line
+                                while (
+                                    tempPos < this.input.length &&
+                                    this.input[tempPos] != '}' &&
+                                    this.input[tempPos] != '\n'
+                                ) {
+                                    if (this.input[tempPos] == '=') {
+                                        return this.input.substring(start, this.pos);
+                                    }
+                                    tempPos++;
+                                }
+                            }
+                        }
                     } else if (this.input[this.pos] == '{') {
                         bracecount++;
                     } else if (this.pos >= this.input.length - 1) {
@@ -165,6 +200,7 @@
             };
         };
 
+        this.numberRegex = /^(\w+),?$/m;
         this.single_value = function() {
             var start = this.pos;
             if (this.tryMatch("{")) {
@@ -173,8 +209,10 @@
                 return this.value_quotes();
             } else {
                 var k = this.key();
-                if (k.match("^[0-9]+$"))
-                    return k;
+                // Return only the key portion if it matches our key regex
+                var numberMatch = k.match(this.numberRegex);
+                if (numberMatch && numberMatch.length > 1)
+                    return numberMatch[1];
                 else if (this.months.indexOf(k.toLowerCase()) >= 0)
                     return k.toLowerCase();
                 else
@@ -202,7 +240,12 @@
                                 // а-яА-Я is Cyrillic
                 //console.log(this.input[this.pos]);
                 if (this.notKey.indexOf(this.input[this.pos]) >= 0) {
-                    if (optional && this.input[this.pos] != ',') {
+                    if (
+                        optional && (
+                            this.input[this.pos] != ',' &&
+                            this.input[this.pos] != '\n'
+                        )
+                    ) {
                         this.pos = start;
                         return null;
                     };
@@ -216,31 +259,46 @@
 
         this.key_equals_value = function() {
             var key = this.key();
+            // console.log({key}, this.input.slice(this.pos, this.pos+25), this.tryMatch('='))
             if (this.tryMatch("=")) {
                 this.match("=");
                 var val = this.value();
                 key = key.trim()
                 return [ key, val ];
             } else {
-                throw TypeError("Value expected, equals sign missing: key_equals_value",
+                throw TypeError("Value expected, equals sign missing: key_equals_value" +
                      this.input.substring(this.pos));
             };
         };
 
         this.key_value_list = function() {
+                // console.log('slice1', this.input.slice(this.pos, this.pos+25))
             var kv = this.key_equals_value();
             this.currentEntry['entryTags'] = {};
             this.currentEntry['entryTags'][kv[0]] = kv[1];
-            while (this.tryMatch(",")) {
-                this.match(",");
-                // fixes problems with commas at the end of a list
-                if (this.tryMatch("}")) {
-                    break;
+            while (!this.tryMatch("}")) {
+                if (this.tryMatch(",")) {
+                    this.match(",");
+                    // If there's just a trailing comma, we're done parsing
+                    if (this.tryMatch('}')) {
+                        break;
+                    }
                 }
-                ;
+                // console.log('slice', this.input.slice(this.pos, this.pos+25))
                 kv = this.key_equals_value();
                 this.currentEntry['entryTags'][kv[0]] = kv[1];
-            };
+                // console.log('kvkv', kv[0], kv[1])
+            }
+            // while (this.tryMatch(",")) {
+            //     this.match(",");
+            //     // fixes problems with commas at the end of a list
+            //     if (this.tryMatch("}")) {
+            //         break;
+            //     }
+            //     ;
+            //     kv = this.key_equals_value();
+            //     this.currentEntry['entryTags'][kv[0]] = kv[1];
+            // };
         };
 
         this.entry_body = function(d) {
@@ -248,7 +306,10 @@
             this.currentEntry['citationKey'] = this.key(true);
             this.currentEntry['entryType'] = d.substring(1);
             if (this.currentEntry['citationKey'] != null) {
-                this.match(",");
+                // We might've just matched a new line
+                if (this.tryMatch(",")) {
+                    this.match(",");
+                }
             }
             this.key_value_list();
             this.entries.push(this.currentEntry);
@@ -291,26 +352,33 @@
 
         this.bibtex = function() {
             while (this.matchAt()) {
-                var d = this.directive();
-                this.match("{");
-                if (d.toUpperCase() == "@STRING") {
-                    this.string();
-                } else if (d.toUpperCase() == "@PREAMBLE") {
-                    this.preamble();
-                } else if (d.toUpperCase() == "@COMMENT") {
-                    this.comment();
-                } else {
-                    this.entry(d);
+                try {
+                    var d = this.directive();
+                    this.match("{");
+                    if (d.toUpperCase() == "@STRING") {
+                        this.string();
+                    } else if (d.toUpperCase() == "@PREAMBLE") {
+                        this.preamble();
+                    } else if (d.toUpperCase() == "@COMMENT") {
+                        this.comment();
+                    } else {
+                        this.entry(d);
+                    }
+                    this.match("}");
+                } catch (error) {
+                    // Suppress individual errors if we can
+                    if (!this.options.loose) {
+                        throw error;
+                    }
                 }
-                this.match("}");
             };
 
             this.alernativeCitationKey();
         };
     };
 
-    exports.toJSON = function(bibtex) {
-        var b = new BibtexParser();
+    exports.toJSON = function(bibtex, options) {
+        var b = new BibtexParser(options);
         b.setInput(bibtex);
         b.bibtex();
         return b.entries;
@@ -323,12 +391,12 @@
     exports.toBibtex = function(json, compact) {
         if (compact === undefined) compact = true;
         var out = '';
-        
+
         var entrysep = ',';
         var indent = '';
         if (!compact) {
 		      entrysep = ',\n';
-		      indent = '    ';        
+		      indent = '    ';
         }
         for ( var i in json) {
             out += "@" + json[i].entryType;
@@ -342,7 +410,7 @@
                 for (var jdx in json[i].entryTags) {
                     if (tags.trim().length != 0)
                         tags += entrysep + indent;
-                    tags += jdx + (compact ? '={' : ' = {') + 
+                    tags += jdx + (compact ? '={' : ' = {') +
                             json[i].entryTags[jdx] + '}';
                 }
                 out += tags;
